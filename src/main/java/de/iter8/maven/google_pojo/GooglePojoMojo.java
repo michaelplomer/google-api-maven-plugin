@@ -14,6 +14,8 @@ import com.google.common.base.CaseFormat;
 import com.squareup.javapoet.*;
 import de.iter8.google.api.webclient.AbstractReactiveGoogleClientRequest;
 import de.iter8.google.api.webclient.AbstractReactiveGoogleJsonClient;
+import de.iter8.google.api.webclient.ListRequest;
+import de.iter8.google.api.webclient.ListResultPage;
 import lombok.*;
 import lombok.experimental.Accessors;
 import lombok.experimental.SuperBuilder;
@@ -49,6 +51,10 @@ public class GooglePojoMojo extends AbstractMojo {
     private static final Function<String, String> API_NAME_TO_PACKAGE_NAME = s -> CaseFormat.LOWER_CAMEL.to(CaseFormat.LOWER_UNDERSCORE, s);
     private static final Pattern ENUM_VALUE_MATCHER = Pattern.compile("\"(\\w+)\"[ -]+([^\\.]+\\.)", Pattern.MULTILINE);
     private static final AnnotationSpec LOMBOK_FLUENT_ACCESSORS = AnnotationSpec.builder(lombok.experimental.Accessors.class).addMember("fluent", "$L", true).build();
+
+    private static final String LIST_ITEMS_PROPERTY = "items";
+    private static final Set<String> LIST_RESULT_PAGE_PROPERTIES = Set.of("nextSyncToken", "nextPageToken", LIST_ITEMS_PROPERTY, "etag", "kind");
+    private static final ClassName LIST_RESULT_TYPE_NAME = ClassName.get(ListResultPage.class);
 
     @Parameter(defaultValue = "${project}", required = true, readonly = true)
     private MavenProject project;
@@ -132,6 +138,8 @@ public class GooglePojoMojo extends AbstractMojo {
         private final String modelPackageName;
         private final ClassName requestClassName;
         private final ClassName clientClassName;
+
+        private final Map<TypeName, HashMap<TypeName, TypeName>> implementingTypes = new HashMap<>();
 
         public GoogleApiBuilder(RestDescription api) {
             this.api = api;
@@ -236,6 +244,10 @@ public class GooglePojoMojo extends AbstractMojo {
                             .addAnnotation(Setter.class)
                             .superclass(ParameterizedTypeName.get(requestClassName, responseClassName))
                             .addField(createStringConstant("REST_PATH", methodDescription.getPath()));
+                    // if responseClass implements ListResultPage, then the methodComponent must implement ListRequest with responseClass as type param
+                    // problem: we don't have actual type information, only names .. but the model classes have already been generated at this point so we could cache the generation results
+                    ofNullable(implementingTypes.get(LIST_RESULT_TYPE_NAME)).map(itemTypeByResponseType -> itemTypeByResponseType.get(responseClassName))
+                            .ifPresent(itemType -> methodComponent.classBuilder.addSuperinterface(ParameterizedTypeName.get(ClassName.get(ListRequest.class), itemType, responseClassName, methodComponent.className)));
 
                     ofNullable(methodDescription.getParameters())
                             .map(Map::entrySet)
@@ -253,6 +265,10 @@ public class GooglePojoMojo extends AbstractMojo {
                     methodComponent.constructorBuilder.addCode("super($T.this, $T.class, $T.$L, REST_PATH, $L);\n", clientClassName, responseClassName, HttpMethod.class, methodDescription.getHttpMethod(), methodDescription.getRequest() != null ? "content" : "null");
                 }
             }
+        }
+
+        private void registerImplementingType(TypeName superType, TypeName implementingType, TypeName itemType) {
+            implementingTypes.computeIfAbsent(superType, typeName -> new HashMap<>()).put(implementingType, itemType);
         }
 
         /**
@@ -392,15 +408,25 @@ public class GooglePojoMojo extends AbstractMojo {
                     .addAnnotation(AnnotationSpec.builder(JsonInclude.class).addMember("value", codeBlockForEnumValue(JsonInclude.Include.NON_NULL)).build());
             if (schema.getProperties() != null && schema.getProperties().size() > 0) {
                 classBuilder.addAnnotation(AllArgsConstructor.class);
+
+                TypeName itemsType = TypeName.OBJECT;
                 for (final var propEntry : schema.getProperties().entrySet()) {
                     final var fldName = FieldName.of(propEntry.getKey());
                     final var fldSchema = propEntry.getValue();
-                    final var fldSpec = FieldSpec.builder(maybeCreateModelTypeAndGetName(fldSchema, fldName, typeName, classBuilder), fldName.name)
+                    final var fldType = maybeCreateModelTypeAndGetName(fldSchema, fldName, typeName, classBuilder);
+                    if (LIST_ITEMS_PROPERTY.equals(propEntry.getKey()) && fldType instanceof ParameterizedTypeName ptn && ptn.typeArguments.size() > 0) {
+                        itemsType = ptn.typeArguments.get(0);
+                    }
+                    final var fldSpec = FieldSpec.builder(fldType, fldName.name)
                             .addModifiers(Modifier.PRIVATE);
                     fldName.maybeAddJsonAnnotation(fldSpec);
                     maybeDecorate(fldSpec, fldSchema);
                     ofNullable(fldSchema.getDescription()).map(GooglePojoMojo::escapeJavaDoc).ifPresent(fldSpec::addJavadoc);
                     classBuilder.addField(fldSpec.build());
+                }
+                if (schema.getProperties().keySet().containsAll(LIST_RESULT_PAGE_PROPERTIES)) {
+                    classBuilder.addSuperinterface(ParameterizedTypeName.get(LIST_RESULT_TYPE_NAME, itemsType));
+                    registerImplementingType(LIST_RESULT_TYPE_NAME, typeName, itemsType);
                 }
             }
             return classBuilder;
@@ -412,7 +438,7 @@ public class GooglePojoMojo extends AbstractMojo {
                     .ifPresent(s -> fldSpec
                             .addAnnotation(AnnotationSpec.builder(JsonFormat.class)
                                     .addMember("shape", codeBlockForEnumValue(JsonFormat.Shape.STRING))
-                                    .addMember("pattern", "$S","yyyy-MM-dd'T'HH:mm:ssXXX")
+                                    .addMember("pattern", "$S", "yyyy-MM-dd'T'HH:mm:ssXXX")
                                     .build()));
         }
 
@@ -486,17 +512,17 @@ public class GooglePojoMojo extends AbstractMojo {
                         }
                     }
                     // todo: infer enums from description?
-                    if (schema.getDescription() != null && schema.getDescription().contains("Possible values are:")) {
-                        final var enumSpec = TypeSpec.enumBuilder(fieldNameHint.toClassName())
-                                .addModifiers(Modifier.PUBLIC);
-                        final var matcher = ENUM_VALUE_MATCHER.matcher(schema.getDescription());
-                        while (matcher.find()) {
-                            final var enumName = FieldName.of(matcher.group(1));
-                            enumSpec.addEnumConstant(enumName.name, enumName.maybeAddJsonAnnotation(TypeSpec.anonymousClassBuilder("").addJavadoc(escapeJavaDoc(matcher.group(2)))).build());
-                        }
-                        parentBuilder.addType(enumSpec.build());
-                        return parentType.nestedClass(fieldNameHint.toClassName());
-                    }
+//                    if (schema.getDescription() != null && schema.getDescription().contains("Possible values are:")) {
+//                        final var enumSpec = TypeSpec.enumBuilder(fieldNameHint.toClassName())
+//                                .addModifiers(Modifier.PUBLIC);
+//                        final var matcher = ENUM_VALUE_MATCHER.matcher(schema.getDescription());
+//                        while (matcher.find()) {
+//                            final var enumName = FieldName.of(matcher.group(1));
+//                            enumSpec.addEnumConstant(enumName.name, enumName.maybeAddJsonAnnotation(TypeSpec.anonymousClassBuilder("").addJavadoc(escapeJavaDoc(matcher.group(2)))).build());
+//                        }
+//                        parentBuilder.addType(enumSpec.build());
+//                        return parentType.nestedClass(fieldNameHint.toClassName());
+//                    }
                     return ofNullable(fieldNameHint)
                             .map(s -> {
                                 switch (s.jsonName) {
